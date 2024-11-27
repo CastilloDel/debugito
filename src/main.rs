@@ -3,7 +3,7 @@ use std::{cmp::min, env, ffi::CString};
 use nix::{
     libc::{SYS_write, ORIG_RAX, RDI, RDX, RSI},
     sys::{
-        ptrace::{read, read_user, syscall, traceme, write, AddressType},
+        ptrace::{getregs, read, read_user, syscall, traceme, write, AddressType},
         wait::wait,
     },
     unistd::{execv, fork, ForkResult, Pid},
@@ -22,23 +22,19 @@ fn main() {
                 nix::sys::wait::WaitStatus::Exited(_, _) => panic!("Child exited"),
                 _ => {}
             }
-            let offset: AddressType = (8 * ORIG_RAX) as AddressType;
-            let syscall_number = read_user(pid, offset).unwrap();
-            if syscall_number == SYS_write {
-                let offset: AddressType = (8 * RDI) as AddressType;
-                let rbx_content = read_user(pid, offset).unwrap();
-                let offset: AddressType = (8 * RSI) as AddressType;
-                let string_address = read_user(pid, offset).unwrap() as AddressType;
-                let offset: AddressType = (8 * RDX) as AddressType;
-                let string_length = read_user(pid, offset).unwrap() as usize;
+            let registers = getregs(pid).unwrap();
+            if registers.orig_rax == SYS_write as u64 {
+                let rbx_content = registers.rbx;
+                let string_address = registers.rsi;
+                let string_length = registers.rdx;
                 println!(
                     "Write with params rdi: {rbx_content} rsi: {string_address:?} rdx: {string_length}"
                 );
-                let read_data = get_data(pid, string_address, string_length);
+                let read_data =
+                    get_data(pid, string_address as AddressType, string_length as usize);
                 let string = String::from_utf8_lossy(&read_data).into_owned();
 
                 println!("From parent: String is {}", string);
-                put_data(pid, string_address, "Now dead!!!\n".as_bytes());
             }
             syscall(pid, None).unwrap();
         },
