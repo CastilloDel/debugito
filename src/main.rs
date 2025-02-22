@@ -1,83 +1,64 @@
-use std::{cmp::min, env, ffi::CString};
-
 use nix::{
-    libc::{SYS_write, ORIG_RAX, RDI, RDX, RSI},
     sys::{
-        ptrace::{getregs, read, read_user, syscall, traceme, write, AddressType},
+        ptrace::{getregs, step, traceme},
         wait::wait,
     },
-    unistd::{execv, fork, ForkResult, Pid},
+    unistd::{ForkResult, execv, fork},
 };
+use std::{env, ffi::CString, path::Path, thread::sleep, time::Duration};
 
 fn main() {
-    let exec_path = env::args().nth(1).unwrap();
+    let exec_path = Path::new(&env::args().nth(1).unwrap())
+        .canonicalize()
+        .unwrap();
+    let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
     match unsafe { fork() }.unwrap() {
         ForkResult::Child => {
             traceme().expect("I don't want to be traced");
-            execv(&CString::new(exec_path).unwrap(), &[c""]).unwrap();
+            execv(&CString::new(exec_path.to_str().unwrap()).unwrap(), &[c""]).unwrap();
         }
         ForkResult::Parent { child: pid } => loop {
-            let status = wait().unwrap();
-            match status {
-                nix::sys::wait::WaitStatus::Exited(_, _) => panic!("Child exited"),
-                _ => {}
-            }
-            let registers = getregs(pid).unwrap();
-            if registers.orig_rax == SYS_write as u64 {
-                let rbx_content = registers.rbx;
-                let string_address = registers.rsi;
-                let string_length = registers.rdx;
-                println!(
-                    "Write with params rdi: {rbx_content} rsi: {string_address:?} rdx: {string_length}"
-                );
-                let read_data =
-                    get_data(pid, string_address as AddressType, string_length as usize);
-                let string = String::from_utf8_lossy(&read_data).into_owned();
+            loop {
+                let status = wait().unwrap();
+                match status {
+                    nix::sys::wait::WaitStatus::Exited(_, _) => panic!("Child exited"),
+                    _ => {}
+                }
+                let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
+                let registers = getregs(pid).unwrap();
 
-                println!("From parent: String is {}", string);
+                if registers.rip > proc_map.address_range.begin
+                    && registers.rip < proc_map.address_range.end
+                {
+                    match loader.find_location(
+                        registers.rip - proc_map.address_range.begin + proc_map.offset,
+                    ) {
+                        Ok(Some(location)) => {
+                            match (location.line, location.file) {
+                                (Some(line), Some(file)) => {
+                                    if file.contains("example") {
+                                        println!("{}", exec_path.to_str().unwrap());
+                                        println!("line:{} {:?}", file, line);
+                                        sleep(Duration::from_secs(1));
+                                    }
+                                }
+                                _ => {}
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                step(pid, None).unwrap();
             }
-            syscall(pid, None).unwrap();
         },
     }
 }
 
-fn put_data(pid: Pid, mut address: AddressType, bytes: &[u8]) {
-    let mut bytes_written = 0;
-    while bytes.len() > bytes_written {
-        let bytes_to_write = min(8, bytes.len() - bytes_written);
-        let word = get_word_from_bytes(&bytes[bytes_written..bytes_written + bytes_to_write]);
-        write(pid, address, word).expect("Couldn't write word");
-        bytes_written += bytes_to_write;
-        address = address.wrapping_add(bytes_to_write);
-    }
-}
-
-fn get_data(pid: Pid, mut address: AddressType, length: usize) -> Vec<u8> {
-    let mut bytes = Vec::<u8>::new();
-    while bytes.len() < length {
-        let word = read(pid, address).expect("Couldn't read word");
-        let mut new_bytes = get_bytes_from_word(word);
-        new_bytes.truncate(min(8, length - bytes.len()));
-        bytes.append(&mut new_bytes);
-        address = address.wrapping_add(8 as usize);
-    }
-    bytes
-}
-
-fn get_bytes_from_word(word: i64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for i in 0..8 {
-        let char = ((word >> (8 * i)) & 0xFF) as u8;
-        bytes.push(char);
-    }
-    bytes
-}
-
-fn get_word_from_bytes(bytes: &[u8]) -> i64 {
-    let mut word = 0;
-    assert!(bytes.len() <= 8);
-    for (i, &byte) in bytes.iter().enumerate() {
-        word |= (byte as i64) << (i * 8);
-    }
-    word
+fn get_range_for_program_source_code(pid: u64, executable: &Path) -> rsprocmaps::Map {
+    let maps = rsprocmaps::from_pid(pid as i32).unwrap();
+    let executable_pathname = rsprocmaps::Pathname::Path(executable.to_str().unwrap().to_string());
+    maps.into_iter()
+        .map(Result::unwrap)
+        .find(|map| &map.pathname == &executable_pathname && map.permissions.executable)
+        .unwrap()
 }

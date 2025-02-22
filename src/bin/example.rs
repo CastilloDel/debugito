@@ -1,8 +1,9 @@
 use std::{thread::sleep, time::Duration};
 
 fn main() {
+    let mut a = 0;
     loop {
-        sleep(Duration::from_secs(2));
-        println!("Still alive");
+        a += 1;
+        a -= 1;
     }
 }
