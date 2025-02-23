@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 addr2line = "0.24.2"
 anyhow = "1.0.96"
+clap = "4.5.30"
 gimli = "0.31"
 nix = {version = "0.29", features = ["ptrace"]}
+reedline = "0.38.0"
 rsprocmaps = "0.3.2"

@@ -1,3 +1,4 @@
+mod repl;
 use nix::{
     sys::{
         ptrace::{getregs, step, traceme},
@@ -5,46 +6,67 @@ use nix::{
     },
     unistd::{ForkResult, Pid, execv, fork},
 };
+use repl::Repl;
 use std::{
     ffi::CString,
-    io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-fn main() {
-    println!("Debugito!");
-    println!("For help, type help");
-    let mut input = String::new();
-    let mut breakpoints = Vec::new();
-    loop {
-        print!("debugito => ");
-        io::stdout().flush().unwrap();
+#[derive(Default)]
+struct Context {
+    breakpoints: Vec<Breakpoint>,
+}
 
-        input.clear();
-        io::stdin().read_line(&mut input).unwrap();
-        let (command, args) = input.trim().split_once(" ").unwrap_or((&input, ""));
-        match command {
-            "b" | "breakpoint" => breakpoints.push(args.parse().unwrap()),
-            "r" | "run" => {
-                let exec_path = Path::new(&args).canonicalize().unwrap();
-                let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
-                let pid = launch_fork(&exec_path);
-                let status = wait().unwrap();
-                if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-                    panic!("Child exited")
-                }
-                let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
-                continue_until_breakpoint(pid, &breakpoints[0], &proc_map, &loader);
-                println!("Here we are");
-            }
-            // "c" | "continue" =>
-            //     continue_until_breakpoint(pid, &breakpoints[0], &proc_map, &loader);
-            // ,
-            "exit" => return,
-            _ => println!("Unrecognized instruction. For help, type help"),
-        }
+fn main() -> anyhow::Result<()> {
+    let mut repl = Repl::new(Context::default())
+        .add_command(
+            clap::Command::new("breakpoint")
+                .alias("b")
+                .arg(
+                    clap::Arg::new("where")
+                        .required(true)
+                        .help("in the form \"source_file:line_number\""),
+                )
+                .about("set a breakpoint"),
+            add_breakpoint,
+        )
+        .add_command(
+            clap::Command::new("run")
+                .alias("r")
+                .arg(
+                    clap::Arg::new("binary")
+                        .required(true)
+                        .help("the path to the executable binary"),
+                )
+                .about("run the specified binary until finding a breakpoint"),
+            run_program,
+        );
+    repl.run()
+}
+
+fn add_breakpoint(args: &clap::ArgMatches, context: &mut Context) -> anyhow::Result<String> {
+    let breakpoint_str = args.get_one::<String>("where").unwrap();
+    context.breakpoints.push(breakpoint_str.parse().unwrap());
+    Ok(String::from("Breakpoint added to ") + breakpoint_str)
+}
+
+fn run_program(args: &clap::ArgMatches, context: &mut Context) -> anyhow::Result<String> {
+    let exec_path = Path::new(&args.get_one::<String>("binary").unwrap())
+        .canonicalize()
+        .unwrap();
+    let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
+    let pid = launch_fork(&exec_path);
+    let status = wait().unwrap();
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
+        panic!("Child exited")
     }
+    if context.breakpoints.is_empty() {
+        return Ok(String::from("Please set at least one breakpoint first"));
+    }
+    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
+    continue_until_breakpoint(pid, &context.breakpoints[0], &proc_map, &loader);
+    Ok(String::from("Reached breakpoint"))
 }
 
 fn launch_fork(executable: &Path) -> Pid {
@@ -102,7 +124,7 @@ struct Breakpoint {
 impl FromStr for Breakpoint {
     type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> anyhow::Result<Self> {
         let (file, number) = s.split_once(":").unwrap();
         Ok(Self {
             file: Path::new(file).canonicalize().unwrap(),
