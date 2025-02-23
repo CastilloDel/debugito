@@ -6,26 +6,45 @@ use nix::{
     unistd::{ForkResult, Pid, execv, fork},
 };
 use std::{
-    env,
     ffi::CString,
+    io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 fn main() {
-    let exec_path = Path::new(&env::args().nth(1).unwrap())
-        .canonicalize()
-        .unwrap();
-    let breakpoint = env::args().nth(2).unwrap().parse::<Breakpoint>().unwrap();
-    let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
-    let pid = launch_fork(&exec_path);
-    let status = wait().unwrap();
-    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-        panic!("Child exited")
+    println!("Debugito!");
+    println!("For help, type help");
+    let mut input = String::new();
+    let mut breakpoints = Vec::new();
+    loop {
+        print!("debugito => ");
+        io::stdout().flush().unwrap();
+
+        input.clear();
+        io::stdin().read_line(&mut input).unwrap();
+        let (command, args) = input.trim().split_once(" ").unwrap_or((&input, ""));
+        match command {
+            "b" | "breakpoint" => breakpoints.push(args.parse().unwrap()),
+            "r" | "run" => {
+                let exec_path = Path::new(&args).canonicalize().unwrap();
+                let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
+                let pid = launch_fork(&exec_path);
+                let status = wait().unwrap();
+                if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
+                    panic!("Child exited")
+                }
+                let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
+                continue_until_breakpoint(pid, &breakpoints[0], &proc_map, &loader);
+                println!("Here we are");
+            }
+            // "c" | "continue" =>
+            //     continue_until_breakpoint(pid, &breakpoints[0], &proc_map, &loader);
+            // ,
+            "exit" => return,
+            _ => println!("Unrecognized instruction. For help, type help"),
+        }
     }
-    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
-    continue_until_breakpoint(pid, breakpoint, proc_map, loader);
-    println!("Here we are");
 }
 
 fn launch_fork(executable: &Path) -> Pid {
@@ -41,9 +60,9 @@ fn launch_fork(executable: &Path) -> Pid {
 
 fn continue_until_breakpoint(
     pid: Pid,
-    breakpoint: Breakpoint,
-    proc_map: rsprocmaps::Map,
-    loader: addr2line::Loader,
+    breakpoint: &Breakpoint,
+    proc_map: &rsprocmaps::Map,
+    loader: &addr2line::Loader,
 ) {
     loop {
         do_step(pid);
