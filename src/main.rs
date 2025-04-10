@@ -1,4 +1,5 @@
 mod repl;
+use anyhow::Context;
 use nix::{
     sys::{
         ptrace::{getregs, step, traceme},
@@ -14,12 +15,12 @@ use std::{
 };
 
 #[derive(Default)]
-struct Context {
+struct ProgramContext {
     breakpoints: Vec<Breakpoint>,
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut repl = Repl::new(Context::default())
+    let mut repl = Repl::new(ProgramContext::default())
         .add_command(
             clap::Command::new("breakpoint")
                 .alias("b")
@@ -45,16 +46,16 @@ fn main() -> anyhow::Result<()> {
     repl.run()
 }
 
-fn add_breakpoint(args: &clap::ArgMatches, context: &mut Context) -> anyhow::Result<String> {
+fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
     let breakpoint_str = args.get_one::<String>("where").unwrap();
-    context.breakpoints.push(breakpoint_str.parse().unwrap());
+    context.breakpoints.push(breakpoint_str.parse()?);
     Ok(String::from("Breakpoint added to ") + breakpoint_str)
 }
 
-fn run_program(args: &clap::ArgMatches, context: &mut Context) -> anyhow::Result<String> {
+fn run_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
     let exec_path = Path::new(&args.get_one::<String>("binary").unwrap())
         .canonicalize()
-        .unwrap();
+        .context("Couldn't find the file")?;
     let loader = addr2line::Loader::new(exec_path.clone()).unwrap();
     let pid = launch_fork(&exec_path);
     let status = wait().unwrap();
@@ -62,7 +63,7 @@ fn run_program(args: &clap::ArgMatches, context: &mut Context) -> anyhow::Result
         panic!("Child exited")
     }
     if context.breakpoints.is_empty() {
-        return Ok(String::from("Please set at least one breakpoint first"));
+        anyhow::bail!("Please set at least one breakpoint first");
     }
     let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &exec_path);
     continue_until_breakpoint(pid, &context.breakpoints[0], &proc_map, &loader);
@@ -125,10 +126,10 @@ impl FromStr for Breakpoint {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> anyhow::Result<Self> {
-        let (file, number) = s.split_once(":").unwrap();
+        let (file, number) = s.split_once(":").ok_or(anyhow::anyhow!("Missing :"))?;
         Ok(Self {
-            file: Path::new(file).canonicalize().unwrap(),
-            line_number: number.parse().unwrap(),
+            file: Path::new(file).to_path_buf(),
+            line_number: number.parse().context("Couldn't parse line number")?,
         })
     }
 }

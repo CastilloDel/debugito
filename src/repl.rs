@@ -26,7 +26,7 @@ impl<T> Repl<T> {
         self.commands.insert(
             command.get_name().to_string(),
             Command {
-                clap_representation: command,
+                clap_representation: command.disable_help_flag(true),
                 action,
             },
         );
@@ -42,6 +42,7 @@ impl<T> Repl<T> {
             command = command.subcommand(subcommand.clap_representation.clone());
         }
         command = command.override_usage("[COMMAND] [ARGS]");
+        command = command.disable_help_flag(true);
         command.render_help().to_string()
     }
 
@@ -51,32 +52,39 @@ impl<T> Repl<T> {
         loop {
             let signal = line_editor.read_line(&prompt)?;
             match signal {
-                Signal::Success(buffer) => {
-                    let parser = clap::Command::new("app")
-                        .subcommands(
-                            self.commands
-                                .values()
-                                .map(|v| v.clap_representation.clone())
-                                .collect::<Vec<clap::Command>>(),
-                        )
-                        .no_binary_name(true);
-                    let matches = parser.try_get_matches_from(buffer.split_whitespace());
-                    if let Ok(matches) = matches {
-                        if let Some((subcommand, args)) = matches.subcommand() {
-                            let result =
-                                (self.commands[subcommand].action)(args, &mut self.context)
-                                    .unwrap();
-                            println!("{}", result);
-                        }
-                    } else {
-                        println!("{}", self.get_help());
-                    }
-                }
+                Signal::Success(buffer) => self.run_command(buffer),
                 Signal::CtrlD | Signal::CtrlC => {
                     println!("\nAborted!");
                     return Ok(());
                 }
             }
+        }
+    }
+
+    fn run_command(&mut self, buffer: String) {
+        let parser = clap::Command::new("app")
+            .subcommands(
+                self.commands
+                    .values()
+                    .map(|v| v.clap_representation.clone())
+                    .collect::<Vec<clap::Command>>(),
+            )
+            .no_binary_name(true);
+        let matches = parser.try_get_matches_from(buffer.split_whitespace());
+        if let Ok(matches) = matches {
+            if let Some((command_name, args)) = matches.subcommand() {
+                let command = self.commands.get_mut(command_name).unwrap();
+                let result = (command.action)(args, &mut self.context);
+                match result {
+                    Ok(message) => println!("{}", message),
+                    Err(message) => {
+                        println!("{}", message);
+                        println!("{}", command.clap_representation.render_help());
+                    }
+                }
+            }
+        } else {
+            println!("{}", self.get_help());
         }
     }
 }
