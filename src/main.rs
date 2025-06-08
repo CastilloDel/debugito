@@ -3,7 +3,7 @@ use anyhow::Context;
 use gimli::{AttributeValue, LittleEndian, Reader};
 use nix::{
     sys::{
-        ptrace::{getregs, step, traceme},
+        ptrace::{self, cont, step, traceme},
         wait::wait,
     },
     unistd::{ForkResult, Pid, execv, fork},
@@ -64,7 +64,8 @@ fn main() -> anyhow::Result<()> {
 
 fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
     let breakpoint_str = args.get_one::<String>("where").unwrap();
-    let breakpoint: Breakpoint = breakpoint_str.parse()?;
+    let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
+    breakpoint.file = breakpoint.file.canonicalize()?;
     let binary = match &context.binary {
         Some(binary) => binary,
         None => return Ok("Please load a binary first".to_owned()),
@@ -83,7 +84,7 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
     if context.binary.is_some() {
         return Ok(String::from("Another binary was already loaded"));
     }
-    let exec_path = PathBuf::from(args.get_one::<String>("binary").unwrap());
+    let exec_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
     let buffer = fs::read(&exec_path).expect("Failed to read file");
 
     let obj_file = object::File::parse(&*buffer).expect("Failed to parse ELF file");
@@ -174,8 +175,23 @@ where
 
                         if let Some(line) = row.line() {
                             let address = row.address();
-                            println!("Breakpointable: 0x{:x} => {:?}:{:?}", address, file, line);
-                            possible_breakpoints.insert((file, line.get()), address);
+                            if file
+                                .file_name()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .contains("example")
+                            {
+                                println!(
+                                    "Breakpointable: 0x{:x} => {:?}:{:?}",
+                                    address, file, line
+                                );
+                            }
+                            let path = match file.canonicalize() {
+                                Ok(path) => path,
+                                Err(_) => continue,
+                            };
+                            possible_breakpoints.insert((path, line.get()), address);
                         }
                     }
                 }
@@ -190,7 +206,6 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         Some(binary) => binary,
         None => return Ok(String::from("You need to load a binary first")),
     };
-    let loader = addr2line::Loader::new(&binary.path).unwrap();
     let pid = launch_fork(&binary.path);
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
@@ -199,16 +214,27 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if context.breakpoints.is_empty() {
         anyhow::bail!("Please set at least one breakpoint first");
     }
-    setup_breakpoint(&context.breakpoints[0]);
     let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary.path);
-    continue_until_breakpoint(pid, &context.breakpoints[0], &proc_map, &loader);
+    setup_breakpoints(pid, context, &proc_map);
+    cont(pid, None).unwrap();
+    let status = wait().unwrap();
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
+        panic!("Child exited")
+    }
+    // continue_until_breakpoint(pid, &context.breakpoints[0], &proc_map, &loader);
     Ok(String::from("Reached breakpoint"))
 }
 
-fn setup_breakpoint(breakpoint: &Breakpoint) {
-    // TODO: Actually set up the break point before hand with a trap instruction,
-    // instead of just single stepping until the correct line is reached
-    todo!()
+fn setup_breakpoints(pid: Pid, context: &mut ProgramContext, proc_map: &rsprocmaps::Map) {
+    for breakpoint in &context.breakpoints {
+        let virtual_address = context.binary.as_ref().unwrap().possible_breakpoints
+            [&(breakpoint.file.clone(), breakpoint.line_number)];
+        let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
+        let mut word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
+        const TRAP_INSTRUCTION: i64 = 0xCC; // Only valid for x86
+        word = (word & (!0xFF)) | TRAP_INSTRUCTION;
+        ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
+    }
 }
 
 fn launch_fork(executable: &Path) -> Pid {
@@ -219,34 +245,6 @@ fn launch_fork(executable: &Path) -> Pid {
             unreachable!()
         }
         ForkResult::Parent { child: pid } => return pid,
-    }
-}
-
-fn continue_until_breakpoint(
-    pid: Pid,
-    breakpoint: &Breakpoint,
-    proc_map: &rsprocmaps::Map,
-    loader: &addr2line::Loader,
-) {
-    loop {
-        do_step(pid);
-        let registers = getregs(pid).unwrap();
-        if registers.rip < proc_map.address_range.begin
-            || registers.rip >= proc_map.address_range.end
-        {
-            continue;
-        }
-        let address_in_file = registers.rip - proc_map.address_range.begin + proc_map.offset;
-        if let Ok(Some(location)) = loader.find_location(address_in_file) {
-            if let (Some(line), Some(file)) = (location.line, location.file) {
-                if file == breakpoint.file.to_str().unwrap()
-                    && line as u64 == breakpoint.line_number
-                {
-                    println!("line:{} {:?}", file, line);
-                    return;
-                }
-            };
-        }
     }
 }
 
