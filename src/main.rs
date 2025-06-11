@@ -21,13 +21,17 @@ use std::{
 #[derive(Default)]
 struct ProgramContext {
     breakpoints: Vec<Breakpoint>,
-    binary: Option<LoadedBinary>,
+    binary_path: Option<PathBuf>,
+    // Matches source file + line number to the address from the DWARF
+    // These addresses aren't final, they need to take into account
+    // where the file is loaded into memory
+    possible_breakpoints: HashMap<(PathBuf, u64), Address>,
+    // Matches the address in memory where there is a breakpoint to
+    // its original instruction (after substituting it for a trap instruction)
+    set_breakpoints: HashMap<Address, u8>,
 }
 
-struct LoadedBinary {
-    possible_breakpoints: HashMap<(PathBuf, u64), u64>,
-    path: PathBuf,
-}
+type Address = u64;
 
 fn main() -> anyhow::Result<()> {
     let mut repl = Repl::new(ProgramContext::default())
@@ -66,11 +70,10 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
     let breakpoint_str = args.get_one::<String>("where").unwrap();
     let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
     breakpoint.file = breakpoint.file.canonicalize()?;
-    let binary = match &context.binary {
-        Some(binary) => binary,
-        None => return Ok("Please load a binary first".to_owned()),
+    if context.binary_path.is_none() {
+        return Ok("Please load a binary first".to_owned());
     };
-    if !binary
+    if !context
         .possible_breakpoints
         .contains_key(&(breakpoint.file.clone(), breakpoint.line_number))
     {
@@ -81,7 +84,7 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
 }
 
 fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    if context.binary.is_some() {
+    if context.binary_path.is_some() {
         return Ok(String::from("Another binary was already loaded"));
     }
     let exec_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
@@ -98,10 +101,8 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
     })
     .unwrap();
 
-    context.binary = Some(LoadedBinary {
-        possible_breakpoints: get_breakpoints_from_dwarf(dwarf)?,
-        path: exec_path,
-    });
+    context.binary_path = Some(exec_path);
+    context.possible_breakpoints = get_breakpoints_from_dwarf(dwarf)?;
     Ok(String::from("Binary loaded"))
 }
 
@@ -210,11 +211,11 @@ where
 }
 
 fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    let binary = match &context.binary {
+    let binary = match &context.binary_path {
         Some(binary) => binary,
         None => return Ok(String::from("You need to load a binary first")),
     };
-    let pid = launch_fork(&binary.path);
+    let pid = launch_fork(&binary);
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
@@ -222,7 +223,7 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if context.breakpoints.is_empty() {
         anyhow::bail!("Please set at least one breakpoint first");
     }
-    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary.path);
+    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary);
     setup_breakpoints(pid, context, &proc_map);
     cont(pid, None).unwrap();
     let status = wait().unwrap();
@@ -234,13 +235,17 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
 
 fn setup_breakpoints(pid: Pid, context: &mut ProgramContext, proc_map: &rsprocmaps::Map) {
     for breakpoint in &context.breakpoints {
-        let virtual_address = context.binary.as_ref().unwrap().possible_breakpoints
-            [&(breakpoint.file.clone(), breakpoint.line_number)];
+        let virtual_address =
+            context.possible_breakpoints[&(breakpoint.file.clone(), breakpoint.line_number)];
         let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
         let mut word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
         const TRAP_INSTRUCTION: i64 = 0xCC; // Only valid for x86
+        let original_instruction = (word & (!0xFF)) as u8;
         word = (word & (!0xFF)) | TRAP_INSTRUCTION;
         ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
+        context
+            .set_breakpoints
+            .insert(real_address, original_instruction);
     }
 }
 
