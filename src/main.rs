@@ -3,7 +3,7 @@ use anyhow::Context;
 use gimli::{AttributeValue, LittleEndian, Reader};
 use nix::{
     sys::{
-        ptrace::{self, cont, step, traceme},
+        ptrace::{self, cont, getregs, step, traceme},
         wait::wait,
     },
     unistd::{ForkResult, Pid, execv, fork},
@@ -18,10 +18,13 @@ use std::{
     str::FromStr,
 };
 
+type Address = u64;
+
 #[derive(Default)]
 struct ProgramContext {
     breakpoints: Vec<Breakpoint>,
     binary_path: Option<PathBuf>,
+    file_buffer: Option<Vec<u8>>,
     // Matches source file + line number to the address from the DWARF
     // These addresses aren't final, they need to take into account
     // where the file is loaded into memory
@@ -30,8 +33,6 @@ struct ProgramContext {
     // its original instruction (after substituting it for a trap instruction)
     set_breakpoints: HashMap<Address, u8>,
 }
-
-type Address = u64;
 
 fn main() -> anyhow::Result<()> {
     let mut repl = Repl::new(ProgramContext::default())
@@ -90,7 +91,16 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
     let exec_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
     let buffer = fs::read(&exec_path).expect("Failed to read file");
 
-    let obj_file = object::File::parse(&*buffer).expect("Failed to parse ELF file");
+    let dwarf = get_dwarf_info(&buffer);
+
+    context.binary_path = Some(exec_path);
+    context.possible_breakpoints = get_breakpoints_from_dwarf(&dwarf)?;
+    context.file_buffer = Some(buffer);
+    Ok(String::from("Binary loaded"))
+}
+
+fn get_dwarf_info(buffer: &Vec<u8>) -> gimli::Dwarf<gimli::EndianReader<LittleEndian, &[u8]>> {
+    let obj_file = object::File::parse(&buffer[..]).expect("Failed to parse ELF file");
 
     let dwarf = gimli::Dwarf::load(|name| -> Result<_, ()> {
         Ok(obj_file
@@ -100,14 +110,11 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
             .unwrap_or(gimli::EndianReader::new(&[], LittleEndian)))
     })
     .unwrap();
-
-    context.binary_path = Some(exec_path);
-    context.possible_breakpoints = get_breakpoints_from_dwarf(dwarf)?;
-    Ok(String::from("Binary loaded"))
+    dwarf
 }
 
 fn get_breakpoints_from_dwarf<R>(
-    dwarf: gimli::Dwarf<R>,
+    dwarf: &gimli::Dwarf<R>,
 ) -> Result<HashMap<(PathBuf, u64), u64>, anyhow::Error>
 where
     R: gimli::Reader + Copy,
@@ -230,7 +237,67 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
+    print_line_info(context, pid, &proc_map)?;
     Ok(String::from("Reached breakpoint"))
+}
+
+fn print_line_info(
+    context: &ProgramContext,
+    pid: Pid,
+    proc_map: &rsprocmaps::Map,
+) -> anyhow::Result<()> {
+    let registers = getregs(pid).unwrap();
+    // We subtract an extra 1 because the rip was already increased by the trap instruction
+    let address = registers.rip - proc_map.address_range.begin + proc_map.offset - 1;
+    let dwarf = get_dwarf_info(context.file_buffer.as_ref().unwrap());
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+
+        while let Some((_, entry)) = entries.next_dfs()? {
+            if entry.tag() != gimli::constants::DW_TAG_compile_unit {
+                continue;
+            }
+
+            let offset = match get_line_program_offset(entry) {
+                Some(offset) => offset,
+                None => continue,
+            };
+
+            let line_program = dwarf.debug_line.program(
+                offset,
+                header.address_size(),
+                unit.comp_dir,
+                unit.name,
+            )?;
+
+            let (program, sequences) = line_program.sequences()?;
+
+            for sequence in sequences {
+                let mut rows = program.resume_from(&sequence);
+
+                while let Ok(Some((_, row))) = rows.next_row() {
+                    if row.end_sequence() {
+                        continue;
+                    }
+
+                    let path = match extract_path(&program, row.file_index()) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    if let Some(line) = row.line() {
+                        if address == row.address() {
+                            println!("Breakpoint at {}:{}", path.to_str().unwrap(), line.get(),);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn setup_breakpoints(pid: Pid, context: &mut ProgramContext, proc_map: &rsprocmaps::Map) {
