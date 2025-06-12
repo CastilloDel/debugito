@@ -13,7 +13,7 @@ use repl::Repl;
 use std::{
     collections::HashMap,
     ffi::CString,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -62,6 +62,12 @@ fn main() -> anyhow::Result<()> {
             clap::Command::new("run")
                 .alias("r")
                 .about("run the specified binary until finding a breakpoint"),
+            run_program,
+        )
+        .add_command(
+            clap::Command::new("continue")
+                .alias("c")
+                .about("Keep running the program until another breakpoint"),
             run_program,
         );
     repl.run()
@@ -222,6 +228,13 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         Some(binary) => binary,
         None => return Ok(String::from("You need to load a binary first")),
     };
+    if !context.set_breakpoints.is_empty() {
+        println!("A program is already being run, do you want to rerun it? (y/n)");
+        let stdin = io::stdin();
+        if stdin.lines().next().unwrap().unwrap() != "y" {
+            return Ok("The original program will be left running".to_owned());
+        }
+    }
     let pid = launch_fork(&binary);
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
