@@ -1,15 +1,11 @@
-mod repl;
 use anyhow::Context;
-use gimli::{AttributeValue, LittleEndian, Reader};
 use nix::{
     sys::{
-        ptrace::{self, cont, getregs, step, traceme},
+        ptrace::{self, cont, step, traceme},
         wait::wait,
     },
     unistd::{ForkResult, Pid, execv, fork},
 };
-use object::{Object, ObjectSection};
-use repl::Repl;
 use std::{
     collections::HashMap,
     ffi::CString,
@@ -17,6 +13,12 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
+
+mod dwarf;
+mod repl;
+
+use dwarf::{get_breakpoints_from_dwarf, get_dwarf_info, print_line_info};
+use repl::Repl;
 
 type Address = u64;
 
@@ -37,17 +39,6 @@ struct ProgramContext {
 fn main() -> anyhow::Result<()> {
     let mut repl = Repl::new(ProgramContext::default())
         .add_command(
-            clap::Command::new("breakpoint")
-                .alias("b")
-                .arg(
-                    clap::Arg::new("where")
-                        .required(true)
-                        .help("in the form \"source_file:line_number\""),
-                )
-                .about("set a breakpoint"),
-            add_breakpoint,
-        )
-        .add_command(
             clap::Command::new("load")
                 .alias("l")
                 .arg(
@@ -59,6 +50,17 @@ fn main() -> anyhow::Result<()> {
             load_program,
         )
         .add_command(
+            clap::Command::new("breakpoint")
+                .alias("b")
+                .arg(
+                    clap::Arg::new("where")
+                        .required(true)
+                        .help("in the form \"source_file:line_number\""),
+                )
+                .about("set a breakpoint"),
+            add_breakpoint,
+        )
+        .add_command(
             clap::Command::new("run")
                 .alias("r")
                 .about("run the specified binary until finding a breakpoint"),
@@ -68,26 +70,9 @@ fn main() -> anyhow::Result<()> {
             clap::Command::new("continue")
                 .alias("c")
                 .about("Keep running the program until another breakpoint"),
-            run_program,
+            continue_program,
         );
     repl.run()
-}
-
-fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    let breakpoint_str = args.get_one::<String>("where").unwrap();
-    let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
-    breakpoint.file = breakpoint.file.canonicalize()?;
-    if context.binary_path.is_none() {
-        return Ok("Please load a binary first".to_owned());
-    };
-    if !context
-        .possible_breakpoints
-        .contains_key(&(breakpoint.file.clone(), breakpoint.line_number))
-    {
-        return Ok("Not a valid breakpoint position".to_owned());
-    }
-    context.breakpoints.push(breakpoint);
-    Ok(String::from("Breakpoint added to ") + breakpoint_str)
 }
 
 fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
@@ -105,122 +90,21 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
     Ok(String::from("Binary loaded"))
 }
 
-fn get_dwarf_info(buffer: &Vec<u8>) -> gimli::Dwarf<gimli::EndianReader<LittleEndian, &[u8]>> {
-    let obj_file = object::File::parse(&buffer[..]).expect("Failed to parse ELF file");
-
-    let dwarf = gimli::Dwarf::load(|name| -> Result<_, ()> {
-        Ok(obj_file
-            .section_by_name(name.name())
-            .and_then(|section| section.data().ok())
-            .map(|data| gimli::EndianReader::new(data, LittleEndian))
-            .unwrap_or(gimli::EndianReader::new(&[], LittleEndian)))
-    })
-    .unwrap();
-    dwarf
-}
-
-fn get_breakpoints_from_dwarf<R>(
-    dwarf: &gimli::Dwarf<R>,
-) -> Result<HashMap<(PathBuf, u64), u64>, anyhow::Error>
-where
-    R: gimli::Reader + Copy,
-{
-    let mut breakpoints = HashMap::new();
-    let mut units = dwarf.units();
-
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
-        let mut entries = unit.entries();
-
-        while let Some((_, entry)) = entries.next_dfs()? {
-            if entry.tag() != gimli::constants::DW_TAG_compile_unit {
-                continue;
-            }
-
-            let offset = match get_line_program_offset(entry) {
-                Some(offset) => offset,
-                None => continue,
-            };
-
-            let line_program = dwarf.debug_line.program(
-                offset,
-                header.address_size(),
-                unit.comp_dir,
-                unit.name,
-            )?;
-
-            let (program, sequences) = line_program.sequences()?;
-
-            for sequence in sequences {
-                breakpoints.extend(process_sequence(&program, &sequence)?);
-            }
-        }
-    }
-
-    Ok(breakpoints)
-}
-
-fn process_sequence<R>(
-    program: &gimli::CompleteLineProgram<R>,
-    sequence: &gimli::LineSequence<R>,
-) -> Result<HashMap<(PathBuf, u64), u64>, anyhow::Error>
-where
-    R: gimli::Reader,
-{
-    let mut rows = program.resume_from(sequence);
-    let mut breakpoints = HashMap::new();
-
-    while let Ok(Some((_, row))) = rows.next_row() {
-        if row.end_sequence() {
-            continue;
-        }
-
-        let path = match extract_path(program, row.file_index()) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        if let Some(line) = row.line() {
-            let address = row.address();
-            breakpoints.insert((path, line.get()), address);
-        }
-    }
-
-    Ok(breakpoints)
-}
-
-fn extract_path<R>(program: &gimli::CompleteLineProgram<R>, file_index: u64) -> Option<PathBuf>
-where
-    R: gimli::Reader,
-{
-    let header = program.header();
-    let file = header.file(file_index)?;
-
-    let dir = match file.directory(header)? {
-        gimli::AttributeValue::String(s) => PathBuf::from(s.to_string().ok()?.into_owned()),
-        _ => return None,
+fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
+    let breakpoint_str = args.get_one::<String>("where").unwrap();
+    let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
+    breakpoint.file = breakpoint.file.canonicalize()?;
+    if context.binary_path.is_none() {
+        return Ok("Please load a binary first".to_owned());
     };
-
-    let file_name = match file.path_name() {
-        gimli::AttributeValue::String(s) => s.to_string().ok()?.into_owned(),
-        _ => return None,
-    };
-
-    dir.join(file_name).canonicalize().ok()
-}
-
-fn get_line_program_offset<R>(
-    entry: &gimli::DebuggingInformationEntry<'_, '_, R, <R as Reader>::Offset>,
-) -> Option<gimli::DebugLineOffset<R::Offset>>
-where
-    R: Reader + Copy,
-{
-    if let AttributeValue::DebugLineRef(offset) =
-        entry.attr(gimli::constants::DW_AT_stmt_list).ok()??.value()
+    if !context
+        .possible_breakpoints
+        .contains_key(&(breakpoint.file.clone(), breakpoint.line_number))
     {
-        return Some(offset);
+        return Ok("Not a valid breakpoint position".to_owned());
     }
-    None
+    context.breakpoints.push(breakpoint);
+    Ok(String::from("Breakpoint added to ") + breakpoint_str)
 }
 
 fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
@@ -254,63 +138,11 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     Ok(String::from("Reached breakpoint"))
 }
 
-fn print_line_info(
-    context: &ProgramContext,
-    pid: Pid,
-    proc_map: &rsprocmaps::Map,
-) -> anyhow::Result<()> {
-    let registers = getregs(pid).unwrap();
-    // We subtract an extra 1 because the rip was already increased by the trap instruction
-    let address = registers.rip - proc_map.address_range.begin + proc_map.offset - 1;
-    let dwarf = get_dwarf_info(context.file_buffer.as_ref().unwrap());
-    let mut units = dwarf.units();
-
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
-        let mut entries = unit.entries();
-
-        while let Some((_, entry)) = entries.next_dfs()? {
-            if entry.tag() != gimli::constants::DW_TAG_compile_unit {
-                continue;
-            }
-
-            let offset = match get_line_program_offset(entry) {
-                Some(offset) => offset,
-                None => continue,
-            };
-
-            let line_program = dwarf.debug_line.program(
-                offset,
-                header.address_size(),
-                unit.comp_dir,
-                unit.name,
-            )?;
-
-            let (program, sequences) = line_program.sequences()?;
-
-            for sequence in sequences {
-                let mut rows = program.resume_from(&sequence);
-
-                while let Ok(Some((_, row))) = rows.next_row() {
-                    if row.end_sequence() {
-                        continue;
-                    }
-
-                    let path = match extract_path(&program, row.file_index()) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-
-                    if let Some(line) = row.line() {
-                        if address == row.address() {
-                            println!("Breakpoint at {}:{}", path.to_str().unwrap(), line.get(),);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+fn continue_program(
+    args: &clap::ArgMatches,
+    context: &mut ProgramContext,
+) -> anyhow::Result<String> {
+    todo!()
 }
 
 fn setup_breakpoints(pid: Pid, context: &mut ProgramContext, proc_map: &rsprocmaps::Map) {
