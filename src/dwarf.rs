@@ -82,7 +82,11 @@ where
 
         if let Some(line) = row.line() {
             let address = row.address();
-            breakpoints.insert((path, line.get()), address);
+            let position = (path, line.get());
+            // We only add the first address for each line
+            if !breakpoints.contains_key(&position) {
+                breakpoints.insert(position, address);
+            }
         }
     }
 

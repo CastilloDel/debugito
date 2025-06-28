@@ -1,7 +1,7 @@
 use anyhow::Context;
 use nix::{
     sys::{
-        ptrace::{self, cont, step, traceme},
+        ptrace::{self, cont, getregs, setregs, step, traceme},
         wait::wait,
     },
     unistd::{ForkResult, Pid, execv, fork},
@@ -33,7 +33,9 @@ struct ProgramContext {
     possible_breakpoints: HashMap<(PathBuf, u64), Address>,
     // Matches the address in memory where there is a breakpoint to
     // its original instruction (after substituting it for a trap instruction)
-    set_breakpoints: HashMap<Address, u8>,
+    set_breakpoints: HashMap<Address, i64>,
+    pid: Option<Pid>,
+    in_breakpoint: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -120,6 +122,7 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         }
     }
     let pid = launch_fork(&binary);
+    context.pid = Some(pid);
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
@@ -128,37 +131,70 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         anyhow::bail!("Please set at least one breakpoint first");
     }
     let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary);
-    setup_breakpoints(pid, context, &proc_map);
+    for breakpoint in context.breakpoints.clone() {
+        setup_breakpoint(pid, context, &proc_map, &breakpoint);
+    }
     cont(pid, None).unwrap();
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
     print_line_info(context, pid, &proc_map)?;
+    context.in_breakpoint = true;
     Ok(String::from("Reached breakpoint"))
 }
 
 fn continue_program(
-    args: &clap::ArgMatches,
+    _args: &clap::ArgMatches,
     context: &mut ProgramContext,
 ) -> anyhow::Result<String> {
-    todo!()
+    let pid = match context.pid {
+        Some(pid) => pid,
+        None => return Ok(String::from("You need to run a binary first")),
+    };
+    let binary = context.binary_path.as_ref().unwrap(); // If there's a pid, there's a binary
+    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, binary);
+    // Before actually calling cont, we need to run the original instruction
+    if context.in_breakpoint {
+        let mut registers = getregs(pid).unwrap();
+        // We subtract an extra 1 because the rip was already increased by the trap instruction
+        registers.rip -= 1;
+        setregs(pid, registers).unwrap();
+        let original_word = context.set_breakpoints[&registers.rip];
+        ptrace::write(pid, registers.rip as ptrace::AddressType, original_word).unwrap();
+        do_step(pid);
+        let word = add_trap_instruction(original_word);
+        ptrace::write(pid, registers.rip as ptrace::AddressType, word).unwrap();
+    }
+    cont(pid, None).unwrap();
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
+        panic!("Child exited")
+    }
+    print_line_info(context, pid, &proc_map)?;
+    context.in_breakpoint = true;
+    Ok(String::from("Reached breakpoint"))
 }
 
-fn setup_breakpoints(pid: Pid, context: &mut ProgramContext, proc_map: &rsprocmaps::Map) {
-    for breakpoint in &context.breakpoints {
-        let virtual_address =
-            context.possible_breakpoints[&(breakpoint.file.clone(), breakpoint.line_number)];
-        let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
-        let mut word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
-        const TRAP_INSTRUCTION: i64 = 0xCC; // Only valid for x86
-        let original_instruction = (word & (!0xFF)) as u8;
-        word = (word & (!0xFF)) | TRAP_INSTRUCTION;
-        ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
-        context
-            .set_breakpoints
-            .insert(real_address, original_instruction);
-    }
+fn setup_breakpoint(
+    pid: Pid,
+    context: &mut ProgramContext,
+    proc_map: &rsprocmaps::Map,
+    breakpoint: &Breakpoint,
+) {
+    let virtual_address =
+        context.possible_breakpoints[&(breakpoint.file.clone(), breakpoint.line_number)];
+    let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
+    let original_word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
+    let word = add_trap_instruction(original_word);
+    ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
+    context.set_breakpoints.insert(real_address, original_word);
+}
+
+fn add_trap_instruction(original_word: i64) -> i64 {
+    const TRAP_INSTRUCTION: i64 = 0xCC;
+    // Only valid for x86
+    let word = (original_word & (!0xFF)) | TRAP_INSTRUCTION;
+    word
 }
 
 fn launch_fork(executable: &Path) -> Pid {
@@ -180,6 +216,7 @@ fn do_step(pid: Pid) {
     }
 }
 
+#[derive(Clone, Debug)]
 struct Breakpoint {
     file: PathBuf,
     line_number: u64,
