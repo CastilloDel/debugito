@@ -2,7 +2,8 @@ use anyhow::{Context, anyhow};
 use nix::{
     sys::{
         ptrace::{self, cont, getregs, setregs, step, traceme},
-        wait::wait,
+        signal::Signal::SIGTRAP,
+        wait::{WaitStatus, wait},
     },
     unistd::{ForkResult, Pid, execv, fork},
 };
@@ -44,7 +45,7 @@ struct RunningProgram {
     // its original instruction (after substituting it for a trap instruction)
     set_breakpoints: HashMap<Address, i64>,
     pid: Pid,
-    in_breakpoint: bool,
+    last_status: WaitStatus,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -80,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         .add_command(
             clap::Command::new("continue")
                 .alias("c")
-                .about("Keep running the program until another breakpoint"),
+                .about("Keep running the program until a breakpoint"),
             continue_program,
         );
     repl.run()
@@ -136,8 +137,7 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         anyhow::bail!("Please set at least one breakpoint first");
     }
     let pid = launch_fork(&binary.binary_path);
-    let status = wait().unwrap();
-    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
         panic!("Child exited")
     }
     let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary.binary_path);
@@ -160,7 +160,7 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         proc_map,
         set_breakpoints,
         pid,
-        in_breakpoint: true,
+        last_status: status,
     });
     Ok(String::from("Reached breakpoint"))
 }
@@ -178,19 +178,19 @@ fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyho
         .ok_or(anyhow!("You need to run a program first"))?;
     let binary = context.binary.as_ref().unwrap(); // If there's a pid, there's a binary
     let pid = running_program.pid;
-    if running_program.in_breakpoint {
+    if let WaitStatus::Stopped(pid, SIGTRAP) = running_program.last_status {
         run_original_breakpoint_instruction(pid, &running_program.set_breakpoints);
     }
     cont(pid, None).unwrap();
-    if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
+    let status = wait().unwrap();
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
+    running_program.last_status = status;
     let line = binary
         .dwarf
         .get_line_from_pid(pid, &running_program.proc_map)?;
     println!("Breakpoint at {}", line);
-    // TODO: remove this from the context and actually check if we are in a breakpoint
-    running_program.in_breakpoint = true;
     Ok(String::from("Reached breakpoint"))
 }
 
