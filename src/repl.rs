@@ -76,9 +76,9 @@ impl<T> Repl<T> {
                 let command = self.commands.get_mut(command_name).unwrap();
                 let result = (command.action)(args, &mut self.context);
                 match result {
-                    Ok(message) => println!("{}", message),
+                    Ok(message) => println!("{}\n", message),
                     Err(message) => {
-                        println!("{}", message);
+                        println!("{}\n", message);
                         println!("{}", command.clap_representation.render_help());
                     }
                 }

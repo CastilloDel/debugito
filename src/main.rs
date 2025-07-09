@@ -108,14 +108,13 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
 }
 
 fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    let breakpoint_str = args.get_one::<String>("where").unwrap();
-    let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
-    breakpoint.file = breakpoint.file.canonicalize()?;
-    // TODO: check if Err is nice enough for this
     let loaded_binary = context
         .binary
         .as_ref()
-        .ok_or(anyhow!("Load a binary first"))?;
+        .ok_or(anyhow!("Please load a binary first"))?;
+    let breakpoint_str = args.get_one::<String>("where").unwrap();
+    let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
+    breakpoint.file = breakpoint.file.canonicalize()?;
     if !loaded_binary.possible_breakpoints.contains_key(&breakpoint) {
         return Ok("Not a valid breakpoint position".to_owned());
     }
