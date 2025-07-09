@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use nix::{
     sys::{
         ptrace::{self, cont, getregs, setregs, step, traceme},
@@ -17,24 +17,33 @@ use std::{
 mod dwarf;
 mod repl;
 
-use dwarf::{get_breakpoints_from_dwarf, get_dwarf_info, print_line_info};
+use dwarf::DwarfInfo;
 use repl::Repl;
 
 type Address = u64;
 
 #[derive(Default)]
 struct ProgramContext {
+    binary: Option<LoadedBinary>,
+    running_program: Option<RunningProgram>,
     breakpoints: Vec<Breakpoint>,
-    binary_path: Option<PathBuf>,
-    file_buffer: Option<Vec<u8>>,
-    // Matches source file + line number to the address from the DWARF
+}
+
+struct LoadedBinary {
+    binary_path: PathBuf,
+    // Matches a breakpoint location to the address from the DWARF
     // These addresses aren't final, they need to take into account
     // where the file is loaded into memory
-    possible_breakpoints: HashMap<(PathBuf, u64), Address>,
+    possible_breakpoints: HashMap<Breakpoint, Address>,
+    dwarf: DwarfInfo,
+}
+
+struct RunningProgram {
+    proc_map: rsprocmaps::Map,
     // Matches the address in memory where there is a breakpoint to
     // its original instruction (after substituting it for a trap instruction)
     set_breakpoints: HashMap<Address, i64>,
-    pid: Option<Pid>,
+    pid: Pid,
     in_breakpoint: bool,
 }
 
@@ -78,17 +87,23 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    if context.binary_path.is_some() {
-        return Ok(String::from("Another binary was already loaded"));
+    if context.binary.is_some() {
+        if !ask_for_confirmation(
+            "Another binary was already loaded, do you want to load a new one?",
+        ) {
+            return Ok(String::from("Kept original binary"));
+        }
     }
-    let exec_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
-    let buffer = fs::read(&exec_path).expect("Failed to read file");
+    let binary_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
+    let file_buffer = fs::read(&binary_path).expect("Failed to read file");
+    let dwarf = DwarfInfo::new(file_buffer);
+    let possible_breakpoints = dwarf.get_breakpoints_from_dwarf()?;
 
-    let dwarf = get_dwarf_info(&buffer);
-
-    context.binary_path = Some(exec_path);
-    context.possible_breakpoints = get_breakpoints_from_dwarf(&dwarf)?;
-    context.file_buffer = Some(buffer);
+    context.binary = Some(LoadedBinary {
+        binary_path,
+        dwarf,
+        possible_breakpoints,
+    });
     Ok(String::from("Binary loaded"))
 }
 
@@ -96,13 +111,12 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
     let breakpoint_str = args.get_one::<String>("where").unwrap();
     let mut breakpoint: Breakpoint = breakpoint_str.parse()?;
     breakpoint.file = breakpoint.file.canonicalize()?;
-    if context.binary_path.is_none() {
-        return Ok("Please load a binary first".to_owned());
-    };
-    if !context
-        .possible_breakpoints
-        .contains_key(&(breakpoint.file.clone(), breakpoint.line_number))
-    {
+    // TODO: check if Err is nice enough for this
+    let loaded_binary = context
+        .binary
+        .as_ref()
+        .ok_or(anyhow!("Load a binary first"))?;
+    if !loaded_binary.possible_breakpoints.contains_key(&breakpoint) {
         return Ok("Not a valid breakpoint position".to_owned());
     }
     context.breakpoints.push(breakpoint);
@@ -110,91 +124,101 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
 }
 
 fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    let binary = match &context.binary_path {
-        Some(binary) => binary,
-        None => return Ok(String::from("You need to load a binary first")),
-    };
-    if !context.set_breakpoints.is_empty() {
-        println!("A program is already being run, do you want to rerun it? (y/n)");
-        let stdin = io::stdin();
-        if stdin.lines().next().unwrap().unwrap() != "y" {
-            return Ok("The original program will be left running".to_owned());
+    let binary = context
+        .binary
+        .as_ref()
+        .ok_or(anyhow!("You need to load a binary first"))?;
+    if context.running_program.is_some() {
+        if !ask_for_confirmation("A program is already being run, do you want to rerun it?") {
+            return Ok("The original program is still running".to_owned());
         }
-    }
-    let pid = launch_fork(&binary);
-    context.pid = Some(pid);
-    let status = wait().unwrap();
-    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-        panic!("Child exited")
     }
     if context.breakpoints.is_empty() {
         anyhow::bail!("Please set at least one breakpoint first");
     }
-    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary);
-    for breakpoint in context.breakpoints.clone() {
-        setup_breakpoint(pid, context, &proc_map, &breakpoint);
+    let pid = launch_fork(&binary.binary_path);
+    let status = wait().unwrap();
+    if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
+        panic!("Child exited")
     }
+    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary.binary_path);
+    let set_breakpoints = context
+        .breakpoints
+        .iter()
+        .map(|breakpoint| {
+            let virtual_address = binary.possible_breakpoints[breakpoint];
+            setup_breakpoint(pid, virtual_address, &proc_map)
+        })
+        .collect();
     cont(pid, None).unwrap();
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
-    print_line_info(context, pid, &proc_map)?;
-    context.in_breakpoint = true;
+    let line = binary.dwarf.get_line_from_pid(pid, &proc_map)?;
+    println!("Breakpoint at {}", line);
+    context.running_program = Some(RunningProgram {
+        proc_map,
+        set_breakpoints,
+        pid,
+        in_breakpoint: true,
+    });
     Ok(String::from("Reached breakpoint"))
 }
 
-fn continue_program(
-    _args: &clap::ArgMatches,
-    context: &mut ProgramContext,
-) -> anyhow::Result<String> {
-    let pid = match context.pid {
-        Some(pid) => pid,
-        None => return Ok(String::from("You need to run a binary first")),
-    };
-    let binary = context.binary_path.as_ref().unwrap(); // If there's a pid, there's a binary
-    let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, binary);
-    // Before actually calling cont, we need to run the original instruction
-    if context.in_breakpoint {
-        let mut registers = getregs(pid).unwrap();
-        // We subtract an extra 1 because the rip was already increased by the trap instruction
-        registers.rip -= 1;
-        setregs(pid, registers).unwrap();
-        let original_word = context.set_breakpoints[&registers.rip];
-        ptrace::write(pid, registers.rip as ptrace::AddressType, original_word).unwrap();
-        do_step(pid);
-        let word = add_trap_instruction(original_word);
-        ptrace::write(pid, registers.rip as ptrace::AddressType, word).unwrap();
+fn ask_for_confirmation(message: &str) -> bool {
+    println!("{} (y/n)", message);
+    let stdin = io::stdin();
+    stdin.lines().next().unwrap().unwrap() == "y"
+}
+
+fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
+    let running_program = context
+        .running_program
+        .as_mut()
+        .ok_or(anyhow!("You need to run a program first"))?;
+    let binary = context.binary.as_ref().unwrap(); // If there's a pid, there's a binary
+    let pid = running_program.pid;
+    if running_program.in_breakpoint {
+        run_original_breakpoint_instruction(pid, &running_program.set_breakpoints);
     }
     cont(pid, None).unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
         panic!("Child exited")
     }
-    print_line_info(context, pid, &proc_map)?;
-    context.in_breakpoint = true;
+    let line = binary
+        .dwarf
+        .get_line_from_pid(pid, &running_program.proc_map)?;
+    println!("Breakpoint at {}", line);
+    // TODO: remove this from the context and actually check if we are in a breakpoint
+    running_program.in_breakpoint = true;
     Ok(String::from("Reached breakpoint"))
 }
 
-fn setup_breakpoint(
-    pid: Pid,
-    context: &mut ProgramContext,
-    proc_map: &rsprocmaps::Map,
-    breakpoint: &Breakpoint,
-) {
-    let virtual_address =
-        context.possible_breakpoints[&(breakpoint.file.clone(), breakpoint.line_number)];
+fn run_original_breakpoint_instruction(pid: Pid, set_breakpoints: &HashMap<u64, i64>) {
+    let mut registers = getregs(pid).unwrap();
+    // We subtract an extra 1 because the rip was already increased by the trap instruction
+    registers.rip -= 1;
+    setregs(pid, registers).unwrap();
+    let original_word = set_breakpoints[&registers.rip];
+    ptrace::write(pid, registers.rip as ptrace::AddressType, original_word).unwrap();
+    do_step(pid);
+    let word = add_trap_instruction(original_word);
+    ptrace::write(pid, registers.rip as ptrace::AddressType, word).unwrap();
+}
+
+fn setup_breakpoint(pid: Pid, virtual_address: u64, proc_map: &rsprocmaps::Map) -> (u64, i64) {
     let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
     let original_word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
     let word = add_trap_instruction(original_word);
     ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
-    context.set_breakpoints.insert(real_address, original_word);
+    (real_address as u64, original_word)
 }
 
-fn add_trap_instruction(original_word: i64) -> i64 {
+fn add_trap_instruction(word: i64) -> i64 {
     const TRAP_INSTRUCTION: i64 = 0xCC;
     // Only valid for x86
-    let word = (original_word & (!0xFF)) | TRAP_INSTRUCTION;
-    word
+    (word & (!0xFF)) | TRAP_INSTRUCTION
 }
 
 fn launch_fork(executable: &Path) -> Pid {
@@ -216,7 +240,7 @@ fn do_step(pid: Pid) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Breakpoint {
     file: PathBuf,
     line_number: u64,
