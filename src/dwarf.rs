@@ -1,10 +1,10 @@
 use anyhow::bail;
-use gimli::{AttributeValue, LittleEndian, Reader};
+use gimli::{AttributeValue, LittleEndian, Location, Reader};
 use nix::{sys::ptrace::getregs, unistd::Pid};
 use object::{Object, ObjectSection};
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
-use crate::Breakpoint;
+use crate::{Breakpoint, registers::get_register_value};
 
 pub struct DwarfInfo {
     inner: gimli::Dwarf<gimli::EndianReader<LittleEndian, Rc<[u8]>>>,
@@ -74,6 +74,7 @@ impl DwarfInfo {
         pid: Pid,
         proc_map: &rsprocmaps::Map,
     ) -> anyhow::Result<String> {
+        // TODO: Abstract this with the similar code in main.rs. Pass the address instead of the pid
         let registers = getregs(pid).unwrap();
         // We subtract an extra 1 because the rip was already increased by the trap instruction
         let address = registers.rip - proc_map.address_range.begin + proc_map.offset - 1;
@@ -128,6 +129,115 @@ impl DwarfInfo {
         }
         bail!("Couldn't find the source code for the address")
     }
+
+    pub fn get_address_of_variable(&self, name: &str, pid: Pid) -> anyhow::Result<u64> {
+        let mut units = self.inner.units();
+
+        while let Some(header) = units.next()? {
+            let unit = self.inner.unit(header.clone())?;
+            let encoding = unit.encoding();
+            let mut entries = unit.entries();
+            let mut depth = 0;
+            let mut parents_stack = Vec::new();
+
+            while let Some((depth_delta, entry)) = entries.next_dfs()? {
+                depth += depth_delta as usize;
+                parents_stack = parents_stack
+                    .into_iter()
+                    .filter(|(d, _)| *d < depth)
+                    .collect();
+                if entry.tag() == gimli::constants::DW_TAG_subprogram {
+                    // Save the current entry as a potential parent
+                    parents_stack.push((depth, entry.clone()));
+                    continue;
+                }
+
+                if entry.tag() != gimli::constants::DW_TAG_variable {
+                    continue;
+                }
+                match self.get_variable_name_from_entry(entry) {
+                    Some(current_name) if current_name == name => {}
+                    _ => continue,
+                }
+
+                if let Some(attr) = entry.attr(gimli::DW_AT_location)? {
+                    match attr.value() {
+                        gimli::AttributeValue::LocationListsRef(_) => {
+                            unreachable!("Support location lists for variables")
+                        }
+                        gimli::AttributeValue::Exprloc(expr) => {
+                            // Evaluate the expression to find the address
+                            let mut evaluator = expr.evaluation(encoding);
+                            let parent_die = &parents_stack.last().unwrap().1;
+                            let frame_base = match get_frame_base_location(parent_die, encoding)? {
+                                Location::Register { register } => {
+                                    let regs = getregs(pid)?;
+                                    get_register_value(&regs, register)?
+                                }
+                                _ => unimplemented!("Frame base not stored in a register"),
+                            };
+                            evaluator.evaluate()?;
+                            // TODO: handle this properly instead of hardcoding the need for the frame base
+                            evaluator.resume_with_frame_base(frame_base)?;
+                            // TODO: handle case with several pieces or non addresses
+                            if let Location::Address { address } = evaluator.result()[0].location {
+                                return Ok(address);
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
+        anyhow::bail!("Couldn't find the variable")
+    }
+
+    fn get_variable_name_from_entry(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<
+            '_,
+            '_,
+            gimli::EndianReader<LittleEndian, Rc<[u8]>>,
+            usize,
+        >,
+    ) -> Option<String> {
+        let attribute_value = entry.attr(gimli::DW_AT_name).ok()??.value();
+        if let AttributeValue::DebugStrRef(offset) = attribute_value {
+            self.inner
+                .debug_str
+                .get_str(offset)
+                .ok()?
+                .to_string()
+                .ok()
+                .map(|s| s.into_owned())
+        } else {
+            None
+        }
+    }
+}
+
+fn get_frame_base_location(
+    debugging_information_entry: &gimli::DebuggingInformationEntry<
+        '_,
+        '_,
+        gimli::EndianReader<LittleEndian, Rc<[u8]>>,
+        usize,
+    >,
+    encoding: gimli::Encoding,
+) -> Result<Location<gimli::EndianReader<LittleEndian, Rc<[u8]>>>, anyhow::Error> {
+    let mut evaluator = match debugging_information_entry
+        .attr(gimli::DW_AT_frame_base)?
+        .unwrap()
+        .value()
+    {
+        AttributeValue::Exprloc(expression) => expression.evaluation(encoding),
+        _ => unimplemented!("Frame based store in something other than a Exprloc"),
+    };
+    evaluator.evaluate()?;
+    // TODO: try to handle locations with offsets/different sizes
+    Ok(evaluator.result()[0].location.clone())
 }
 
 fn process_sequence<R>(

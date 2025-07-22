@@ -16,6 +16,7 @@ use std::{
 };
 
 mod dwarf;
+mod registers;
 mod repl;
 
 use dwarf::DwarfInfo;
@@ -83,6 +84,17 @@ fn main() -> anyhow::Result<()> {
                 .alias("c")
                 .about("Keep running the program until a breakpoint"),
             continue_program,
+        )
+        .add_command(
+            clap::Command::new("print")
+                .alias("p")
+                .arg(
+                    clap::Arg::new("var")
+                        .required(true)
+                        .help("name of the variable"),
+                )
+                .about("Print the value of a variable"),
+            print_var,
         );
     repl.run()
 }
@@ -109,6 +121,7 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
 }
 
 fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
+    // TODO: Support adding breakpoints while program is already running
     let loaded_binary = context
         .binary
         .as_ref()
@@ -192,6 +205,23 @@ fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyho
         .get_line_from_pid(pid, &running_program.proc_map)?;
     println!("Breakpoint at {}", line);
     Ok(String::from("Reached breakpoint"))
+}
+
+fn print_var(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
+    let variable_name = args.get_one::<String>("var").unwrap();
+    let program = context
+        .running_program
+        .as_mut()
+        .ok_or(anyhow!("You need to run a program first"))?;
+    let binary = context.binary.as_mut().unwrap();
+    let address = binary
+        .dwarf
+        .get_address_of_variable(variable_name, program.pid)?;
+
+    let word = ptrace::read(program.pid, address as ptrace::AddressType)?;
+    // TODO: Take into account the variable type, instead of assumming u32
+    println!("{}", word as u32);
+    Ok("".to_string())
 }
 
 fn run_original_breakpoint_instruction(pid: Pid, set_breakpoints: &HashMap<u64, i64>) {
