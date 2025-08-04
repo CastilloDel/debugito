@@ -10,6 +10,11 @@ pub struct DwarfInfo {
     inner: gimli::Dwarf<gimli::EndianReader<LittleEndian, Rc<[u8]>>>,
 }
 
+pub struct LinePosition {
+    pub path: PathBuf,
+    pub line_number: usize,
+}
+
 impl DwarfInfo {
     pub fn new(buffer: Vec<u8>) -> Self {
         let obj_file = object::File::parse(buffer.as_slice()).expect("Failed to parse ELF file");
@@ -73,7 +78,7 @@ impl DwarfInfo {
         &self,
         pid: Pid,
         proc_map: &rsprocmaps::Map,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<LinePosition> {
         // TODO: Abstract this with the similar code in main.rs. Pass the address instead of the pid
         let registers = getregs(pid).unwrap();
         // We subtract an extra 1 because the rip was already increased by the trap instruction
@@ -120,7 +125,10 @@ impl DwarfInfo {
 
                         if let Some(line) = row.line() {
                             if address == row.address() {
-                                return Ok(format!("{}:{}", path.to_str().unwrap(), line.get()));
+                                return Ok(LinePosition {
+                                    path,
+                                    line_number: line.get() as usize,
+                                });
                             }
                         }
                     }

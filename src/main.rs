@@ -177,8 +177,17 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
-    let line = binary.dwarf.get_line_from_pid(pid, &proc_map)?;
-    println!("Breakpoint at {}", line);
+    let line_pos = binary.dwarf.get_line_from_pid(pid, &proc_map)?;
+    let line = fs::read_to_string(&line_pos.path)?
+        .lines()
+        .nth(line_pos.line_number)
+        .unwrap()
+        .to_owned();
+    println!(
+        "Breakpoint at {}:\n{}",
+        line_pos.path.to_str().unwrap(),
+        line
+    );
     context.running_program = Some(RunningProgram {
         proc_map,
         set_breakpoints,
@@ -210,10 +219,19 @@ fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyho
         panic!("Child exited")
     }
     running_program.last_status = status;
-    let line = binary
+    let line_pos = binary
         .dwarf
         .get_line_from_pid(pid, &running_program.proc_map)?;
-    println!("Breakpoint at {}", line);
+    let line = fs::read_to_string(&line_pos.path)?
+        .lines()
+        .nth(line_pos.line_number)
+        .unwrap()
+        .to_owned();
+    println!(
+        "Breakpoint at {}:\n{}",
+        line_pos.path.to_str().unwrap(),
+        line
+    );
     Ok(String::from("Reached breakpoint"))
 }
 
