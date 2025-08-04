@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use clap::Arg;
 use nix::{
     sys::{
         ptrace::{self, cont, getregs, setregs, step, traceme},
@@ -50,12 +51,20 @@ struct RunningProgram {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut repl = Repl::new(ProgramContext::default())
+    let arg_matches = clap::Command::new("Debugito")
+        .about("Simple debugger")
+        .arg(Arg::new("binary_path"))
+        .get_matches();
+    let mut context = ProgramContext::default();
+    if arg_matches.contains_id("binary_path") {
+        load_program(&arg_matches, &mut context)?;
+    }
+    let mut repl = Repl::new(context)
         .add_command(
             clap::Command::new("load")
                 .alias("l")
                 .arg(
-                    clap::Arg::new("binary")
+                    clap::Arg::new("binary_path")
                         .required(true)
                         .help("the path to the executable binary"),
                 )
@@ -107,7 +116,8 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
             return Ok(String::from("Kept original binary"));
         }
     }
-    let binary_path = PathBuf::from(args.get_one::<String>("binary").unwrap()).canonicalize()?;
+    let binary_path =
+        PathBuf::from(args.get_one::<String>("binary_path").unwrap()).canonicalize()?;
     let file_buffer = fs::read(&binary_path).expect("Failed to read file");
     let dwarf = DwarfInfo::new(file_buffer);
     let possible_breakpoints = dwarf.get_breakpoints_from_dwarf()?;
