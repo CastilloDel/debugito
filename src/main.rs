@@ -131,7 +131,6 @@ fn load_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow
 }
 
 fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
-    // TODO: Support adding breakpoints while program is already running
     let loaded_binary = context
         .binary
         .as_ref()
@@ -141,6 +140,21 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
     breakpoint.file = breakpoint.file.canonicalize()?;
     if !loaded_binary.possible_breakpoints.contains_key(&breakpoint) {
         return Ok("Not a valid breakpoint position".to_owned());
+    }
+    if context
+        .breakpoints
+        .iter()
+        .find(|&b| b == &breakpoint)
+        .is_some()
+    {
+        return Ok("Breakpoint already exists".to_owned());
+    }
+    if let Some(running_program) = &context.running_program {
+        setup_breakpoint(
+            running_program.pid,
+            loaded_binary.possible_breakpoints[&breakpoint],
+            &running_program.proc_map,
+        );
     }
     context.breakpoints.push(breakpoint);
     Ok(String::from("Breakpoint added to ") + breakpoint_str)
