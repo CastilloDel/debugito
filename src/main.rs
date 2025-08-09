@@ -236,7 +236,7 @@ fn print_source_code_line(
     let line_pos = binary.dwarf.get_line_from_address(address)?;
     let line = fs::read_to_string(&line_pos.path)?
         .lines()
-        .nth(line_pos.line_number)
+        .nth(line_pos.line_number - 1)
         .unwrap()
         .to_owned();
     println!(
