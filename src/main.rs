@@ -168,8 +168,8 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
         .breakpoints
         .iter()
         .map(|breakpoint| {
-            let virtual_address = binary.possible_breakpoints[breakpoint];
-            setup_breakpoint(pid, virtual_address, &proc_map)
+            let relative_address = binary.possible_breakpoints[breakpoint];
+            setup_breakpoint(pid, relative_address, &proc_map)
         })
         .collect();
     cont(pid, None).unwrap();
@@ -177,17 +177,7 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
         panic!("Child exited")
     }
-    let line_pos = binary.dwarf.get_line_from_pid(pid, &proc_map)?;
-    let line = fs::read_to_string(&line_pos.path)?
-        .lines()
-        .nth(line_pos.line_number)
-        .unwrap()
-        .to_owned();
-    println!(
-        "Breakpoint at {}:\n{}",
-        line_pos.path.to_str().unwrap(),
-        line
-    );
+    print_source_code_line(&proc_map, binary, pid)?;
     context.running_program = Some(RunningProgram {
         proc_map,
         set_breakpoints,
@@ -219,20 +209,29 @@ fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyho
         panic!("Child exited")
     }
     running_program.last_status = status;
-    let line_pos = binary
-        .dwarf
-        .get_line_from_pid(pid, &running_program.proc_map)?;
+    print_source_code_line(&running_program.proc_map, binary, pid)?;
+    Ok(String::from("Reached breakpoint"))
+}
+
+fn print_source_code_line(
+    proc_map: &rsprocmaps::Map,
+    binary: &LoadedBinary,
+    pid: Pid,
+) -> Result<(), anyhow::Error> {
+    let address = virtual_address_to_relative(get_last_instruction_address(pid), proc_map);
+    let line_pos = binary.dwarf.get_line_from_address(address)?;
     let line = fs::read_to_string(&line_pos.path)?
         .lines()
         .nth(line_pos.line_number)
         .unwrap()
         .to_owned();
     println!(
-        "Breakpoint at {}:\n{}",
+        "{}:{}\n{}",
         line_pos.path.to_str().unwrap(),
+        line_pos.line_number,
         line
     );
-    Ok(String::from("Reached breakpoint"))
+    Ok(())
 }
 
 fn print_var(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
@@ -252,6 +251,20 @@ fn print_var(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::R
     Ok("".to_string())
 }
 
+fn get_last_instruction_address(pid: Pid) -> u64 {
+    let registers = getregs(pid).unwrap();
+    // We subtract an extra 1 because the rip was already increased by the trap instruction
+    registers.rip - 1
+}
+
+fn virtual_address_to_relative(address: u64, proc_map: &rsprocmaps::Map) -> u64 {
+    address - proc_map.address_range.begin + proc_map.offset
+}
+
+fn relative_address_to_virtual(address: u64, proc_map: &rsprocmaps::Map) -> u64 {
+    address + proc_map.address_range.begin - proc_map.offset
+}
+
 fn run_original_breakpoint_instruction(pid: Pid, set_breakpoints: &HashMap<u64, i64>) {
     let mut registers = getregs(pid).unwrap();
     // We subtract an extra 1 because the rip was already increased by the trap instruction
@@ -264,12 +277,12 @@ fn run_original_breakpoint_instruction(pid: Pid, set_breakpoints: &HashMap<u64, 
     ptrace::write(pid, registers.rip as ptrace::AddressType, word).unwrap();
 }
 
-fn setup_breakpoint(pid: Pid, virtual_address: u64, proc_map: &rsprocmaps::Map) -> (u64, i64) {
-    let real_address = virtual_address + proc_map.address_range.begin - proc_map.offset;
-    let original_word = ptrace::read(pid, real_address as ptrace::AddressType).unwrap();
+fn setup_breakpoint(pid: Pid, relative_address: u64, proc_map: &rsprocmaps::Map) -> (u64, i64) {
+    let virtual_address = relative_address_to_virtual(relative_address, proc_map);
+    let original_word = ptrace::read(pid, virtual_address as ptrace::AddressType).unwrap();
     let word = add_trap_instruction(original_word);
-    ptrace::write(pid, real_address as ptrace::AddressType, word).unwrap();
-    (real_address as u64, original_word)
+    ptrace::write(pid, virtual_address as ptrace::AddressType, word).unwrap();
+    (virtual_address as u64, original_word)
 }
 
 fn add_trap_instruction(word: i64) -> i64 {

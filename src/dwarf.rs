@@ -74,15 +74,7 @@ impl DwarfInfo {
         Ok(breakpoints)
     }
 
-    pub fn get_line_from_pid(
-        &self,
-        pid: Pid,
-        proc_map: &rsprocmaps::Map,
-    ) -> anyhow::Result<LinePosition> {
-        // TODO: Abstract this with the similar code in main.rs. Pass the address instead of the pid
-        let registers = getregs(pid).unwrap();
-        // We subtract an extra 1 because the rip was already increased by the trap instruction
-        let address = registers.rip - proc_map.address_range.begin + proc_map.offset - 1;
+    pub fn get_line_from_address(&self, address: u64) -> anyhow::Result<LinePosition> {
         let mut units = self.inner.units();
 
         while let Some(header) = units.next()? {
