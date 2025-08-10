@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use reedline::{Reedline, Signal};
+use reedline::{
+    ColumnarMenu, Completer, Emacs, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
+    ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
+};
 
 type Action<T> = fn(&clap::ArgMatches, &mut T) -> anyhow::Result<String>;
 
@@ -47,7 +50,26 @@ impl<T> Repl<T> {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
-        let mut line_editor = Reedline::create();
+        let completer = Box::new(CustomCompleter::new(&self.commands));
+        // Use the interactive menu to select options from the completer
+        let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+        // Set up the required keybindings
+        let mut keybindings = default_emacs_keybindings();
+        keybindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Menu("completion_menu".to_string()),
+                ReedlineEvent::MenuNext,
+            ]),
+        );
+
+        let edit_mode = Box::new(Emacs::new(keybindings));
+
+        let mut line_editor = Reedline::create()
+            .with_completer(completer)
+            .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+            .with_edit_mode(edit_mode);
         let prompt = CustomPrompt::new();
         loop {
             let signal = line_editor.read_line(&prompt)?;
@@ -86,6 +108,35 @@ impl<T> Repl<T> {
         } else {
             println!("{}", self.get_help());
         }
+    }
+}
+
+struct CustomCompleter {
+    commands: Vec<String>,
+}
+
+impl CustomCompleter {
+    fn new<T>(commands: &HashMap<String, Command<T>>) -> Self {
+        Self {
+            commands: commands.keys().cloned().collect(),
+        }
+    }
+}
+
+impl Completer for CustomCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        self.commands
+            .iter()
+            .filter(|command| command.starts_with(line))
+            .map(|command| Suggestion {
+                value: command.to_string(),
+                description: None,
+                style: None,
+                extra: None,
+                span: reedline::Span { start: 0, end: pos },
+                append_whitespace: true,
+            })
+            .collect()
     }
 }
 
