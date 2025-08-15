@@ -125,7 +125,8 @@ impl CustomCompleter {
 
 impl Completer for CustomCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        self.commands
+        let command_completions = self
+            .commands
             .iter()
             .filter(|command| command.starts_with(line))
             .map(|command| Suggestion {
@@ -136,7 +137,47 @@ impl Completer for CustomCompleter {
                 span: reedline::Span { start: 0, end: pos },
                 append_whitespace: true,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if !command_completions.is_empty() {
+            return command_completions;
+        }
+        if let Some(_) = self
+            .commands
+            .iter()
+            .find(|&command| line.starts_with(&format!("{command} ")))
+        {
+            let last_word_start = line.rfind(" ").unwrap() + 1;
+            let options = glob::MatchOptions {
+                case_sensitive: false,
+                require_literal_separator: false,
+                require_literal_leading_dot: false,
+            };
+            let pattern = &format!("{}*", &line[last_word_start..]);
+            let collect = glob::glob_with(pattern, options)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap();
+                    let mut path_str = path.to_string_lossy().into_owned();
+                    if path.is_dir() {
+                        path_str += "/";
+                    }
+                    let span = reedline::Span {
+                        start: last_word_start,
+                        end: std::cmp::min(last_word_start + path_str.len(), pos),
+                    };
+                    Suggestion {
+                        value: path_str,
+                        description: None,
+                        style: None,
+                        extra: None,
+                        span,
+                        append_whitespace: false,
+                    }
+                })
+                .collect();
+            return collect;
+        }
+        vec![]
     }
 }
 
