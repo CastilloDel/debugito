@@ -185,7 +185,8 @@ fn run_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow:
             .unwrap_or(vec![]),
     );
     if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
-        panic!("Child exited")
+        context.running_program = None;
+        return Ok("Program exited".to_owned());
     }
     let proc_map = get_range_for_program_source_code(pid.as_raw() as u64, &binary.binary_path);
     let set_breakpoints = context
@@ -199,7 +200,8 @@ fn run_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow:
     cont(pid, None).unwrap();
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-        panic!("Child exited")
+        context.running_program = None;
+        return Ok("Program exited".to_owned());
     }
     print_source_code_line(&proc_map, binary, pid)?;
     context.running_program = Some(RunningProgram {
@@ -225,12 +227,16 @@ fn continue_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyho
     let binary = context.binary.as_ref().unwrap(); // If there's a pid, there's a binary
     let pid = running_program.pid;
     if let WaitStatus::Stopped(pid, SIGTRAP) = running_program.last_status {
-        run_original_breakpoint_instruction(pid, &running_program.set_breakpoints);
+        if run_original_breakpoint_instruction(pid, &running_program.set_breakpoints).is_err() {
+            context.running_program = None;
+            return Ok("Program exited".to_owned());
+        };
     }
     cont(pid, None).unwrap();
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-        panic!("Child exited")
+        context.running_program = None;
+        return Ok("Program exited".to_owned());
     }
     running_program.last_status = status;
     print_source_code_line(&running_program.proc_map, binary, pid)?;
@@ -289,16 +295,20 @@ fn relative_address_to_virtual(address: u64, proc_map: &rsprocmaps::Map) -> u64 
     address + proc_map.address_range.begin - proc_map.offset
 }
 
-fn run_original_breakpoint_instruction(pid: Pid, set_breakpoints: &HashMap<u64, i64>) {
+fn run_original_breakpoint_instruction(
+    pid: Pid,
+    set_breakpoints: &HashMap<u64, i64>,
+) -> anyhow::Result<()> {
     let mut registers = getregs(pid).unwrap();
     // We subtract an extra 1 because the rip was already increased by the trap instruction
     registers.rip -= 1;
     setregs(pid, registers).unwrap();
     let original_word = set_breakpoints[&registers.rip];
     ptrace::write(pid, registers.rip as ptrace::AddressType, original_word).unwrap();
-    do_step(pid);
+    do_step(pid)?;
     let word = add_trap_instruction(original_word);
     ptrace::write(pid, registers.rip as ptrace::AddressType, word).unwrap();
+    Ok(())
 }
 
 fn setup_breakpoint(pid: Pid, relative_address: u64, proc_map: &rsprocmaps::Map) -> (u64, i64) {
@@ -330,12 +340,13 @@ fn launch_fork(executable: &Path, args: Vec<&String>) -> Pid {
     }
 }
 
-fn do_step(pid: Pid) {
+fn do_step(pid: Pid) -> anyhow::Result<()> {
     step(pid, None).unwrap();
     let status = wait().unwrap();
     if let nix::sys::wait::WaitStatus::Exited(_, _) = status {
-        panic!("Child exited")
+        anyhow::bail!("Child exited")
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
