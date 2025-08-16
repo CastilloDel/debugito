@@ -85,6 +85,11 @@ fn main() -> anyhow::Result<()> {
         .add_command(
             clap::Command::new("run")
                 .alias("r")
+                .arg(
+                    Arg::new("program_args")
+                        .trailing_var_arg(true)
+                        .num_args(0..),
+                )
                 .about("run the specified binary until finding a breakpoint"),
             run_program,
         )
@@ -160,7 +165,7 @@ fn add_breakpoint(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyh
     Ok(String::from("Breakpoint added to ") + breakpoint_str)
 }
 
-fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
+fn run_program(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Result<String> {
     let binary = context
         .binary
         .as_ref()
@@ -173,7 +178,12 @@ fn run_program(_: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::Re
     if context.breakpoints.is_empty() {
         anyhow::bail!("Please set at least one breakpoint first");
     }
-    let pid = launch_fork(&binary.binary_path);
+    let pid = launch_fork(
+        &binary.binary_path,
+        args.get_many("program_args")
+            .map(|args| args.collect::<Vec<_>>())
+            .unwrap_or(vec![]),
+    );
     if let nix::sys::wait::WaitStatus::Exited(_, _) = wait().unwrap() {
         panic!("Child exited")
     }
@@ -305,11 +315,15 @@ fn add_trap_instruction(word: i64) -> i64 {
     (word & (!0xFF)) | TRAP_INSTRUCTION
 }
 
-fn launch_fork(executable: &Path) -> Pid {
+fn launch_fork(executable: &Path, args: Vec<&String>) -> Pid {
+    let args = args
+        .iter()
+        .map(|arg| CString::new(arg.as_str()).unwrap())
+        .collect::<Vec<_>>();
     match unsafe { fork() }.unwrap() {
         ForkResult::Child => {
             traceme().expect("I don't want to be traced");
-            execv(&CString::new(executable.to_str().unwrap()).unwrap(), &[c""]).unwrap();
+            execv(&CString::new(executable.to_str().unwrap()).unwrap(), &args).unwrap();
             unreachable!()
         }
         ForkResult::Parent { child: pid } => return pid,
