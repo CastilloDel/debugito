@@ -118,7 +118,11 @@ struct CustomCompleter {
 impl CustomCompleter {
     fn new<T>(commands: &HashMap<String, Command<T>>) -> Self {
         Self {
-            commands: commands.keys().cloned().collect(),
+            commands: commands
+                .values()
+                .flat_map(|command| command.clap_representation.get_name_and_visible_aliases())
+                .map(String::from)
+                .collect(),
         }
     }
 }

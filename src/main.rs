@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     let mut repl = Repl::new(context)
         .add_command(
             clap::Command::new("load")
-                .alias("l")
+                .visible_alias("l")
                 .arg(
                     clap::Arg::new("binary_path")
                         .required(true)
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
         )
         .add_command(
             clap::Command::new("breakpoint")
-                .alias("b")
+                .visible_alias("b")
                 .arg(
                     clap::Arg::new("where")
                         .required(true)
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         )
         .add_command(
             clap::Command::new("run")
-                .alias("r")
+                .visible_alias("r")
                 .arg(
                     Arg::new("program_args")
                         .trailing_var_arg(true)
@@ -95,13 +95,13 @@ fn main() -> anyhow::Result<()> {
         )
         .add_command(
             clap::Command::new("continue")
-                .alias("c")
+                .visible_alias("c")
                 .about("Keep running the program until a breakpoint"),
             continue_program,
         )
         .add_command(
             clap::Command::new("print")
-                .alias("p")
+                .visible_alias("p")
                 .arg(
                     clap::Arg::new("var")
                         .required(true)
