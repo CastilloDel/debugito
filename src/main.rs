@@ -271,14 +271,31 @@ fn print_var(args: &clap::ArgMatches, context: &mut ProgramContext) -> anyhow::R
         .as_mut()
         .ok_or(anyhow!("You need to run a program first"))?;
     let binary = context.binary.as_mut().unwrap();
-    let address = binary
-        .dwarf
-        .get_address_of_variable(variable_name, program.pid)?;
+    let variable = binary.dwarf.get_variable_info(variable_name, program.pid)?;
 
-    let word = ptrace::read(program.pid, address as ptrace::AddressType)?;
-    // TODO: Take into account the variable type, instead of assumming u32
-    println!("{}", word as u32);
+    print_var_with_info(program, variable)?;
     Ok("".to_string())
+}
+
+fn print_var_with_info(
+    program: &mut RunningProgram,
+    variable_info: dwarf::VariableInfo,
+) -> Result<(), anyhow::Error> {
+    let word = ptrace::read(program.pid, variable_info.address as ptrace::AddressType)?;
+    let word = u64::from_be_bytes(word.to_be_bytes());
+    let value = word & (u64::MAX >> (64 - variable_info.size));
+    match variable_info.base_type {
+        dwarf::BaseType::Boolean => println!("{}", value == 1),
+        dwarf::BaseType::Float => {
+            if variable_info.size == 32 {
+                println!("{}", f32::from_be_bytes((value as u32).to_be_bytes()));
+            } else {
+                println!("{}", f64::from_be_bytes(value.to_be_bytes()));
+            }
+        }
+        dwarf::BaseType::Signed | dwarf::BaseType::Unsigned => println!("{}", value),
+    }
+    Ok(())
 }
 
 fn get_last_instruction_address(pid: Pid) -> u64 {

@@ -1,5 +1,5 @@
-use anyhow::bail;
-use gimli::{AttributeValue, LittleEndian, Location, Reader};
+use anyhow::{anyhow, bail};
+use gimli::{AttributeValue, DwAte, LittleEndian, Location, Reader};
 use nix::{sys::ptrace::getregs, unistd::Pid};
 use object::{Object, ObjectSection};
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
@@ -13,6 +13,19 @@ pub struct DwarfInfo {
 pub struct LinePosition {
     pub path: PathBuf,
     pub line_number: usize,
+}
+
+pub struct VariableInfo {
+    pub address: u64,
+    pub base_type: BaseType,
+    pub size: u64,
+}
+
+pub enum BaseType {
+    Boolean,
+    Float,
+    Signed,
+    Unsigned,
 }
 
 impl DwarfInfo {
@@ -130,7 +143,7 @@ impl DwarfInfo {
         bail!("Couldn't find the source code for the address")
     }
 
-    pub fn get_address_of_variable(&self, name: &str, pid: Pid) -> anyhow::Result<u64> {
+    pub fn get_variable_info(&self, name: &str, pid: Pid) -> anyhow::Result<VariableInfo> {
         let mut units = self.inner.units();
 
         while let Some(header) = units.next()? {
@@ -141,7 +154,7 @@ impl DwarfInfo {
             let mut parents_stack = Vec::new();
 
             while let Some((depth_delta, entry)) = entries.next_dfs()? {
-                depth += depth_delta as usize;
+                depth += depth_delta;
                 parents_stack = parents_stack
                     .into_iter()
                     .filter(|(d, _)| *d < depth)
@@ -159,6 +172,9 @@ impl DwarfInfo {
                     Some(current_name) if current_name == name => {}
                     _ => continue,
                 }
+
+                let (base_type, size) = get_type_info(&unit, entry)?
+                    .ok_or_else(|| anyhow!("Couldn't find the type of the variable"))?;
 
                 if let Some(attr) = entry.attr(gimli::DW_AT_location)? {
                     match attr.value() {
@@ -181,12 +197,14 @@ impl DwarfInfo {
                             evaluator.resume_with_frame_base(frame_base)?;
                             // TODO: handle case with several pieces or non addresses
                             if let Location::Address { address } = evaluator.result()[0].location {
-                                return Ok(address);
-                            } else {
-                                continue;
+                                return Ok(VariableInfo {
+                                    address,
+                                    base_type,
+                                    size,
+                                });
                             }
                         }
-                        _ => continue,
+                        _ => unreachable!("Unrecognized variable location info"),
                     }
                 }
             }
@@ -215,6 +233,64 @@ impl DwarfInfo {
         } else {
             None
         }
+    }
+}
+
+fn get_type_info(
+    unit: &gimli::Unit<gimli::EndianReader<LittleEndian, Rc<[u8]>>, usize>,
+    entry: &gimli::DebuggingInformationEntry<
+        '_,
+        '_,
+        gimli::EndianReader<LittleEndian, Rc<[u8]>>,
+        usize,
+    >,
+) -> Result<Option<(BaseType, u64)>, anyhow::Error> {
+    if let Some(attr) = entry.attr(gimli::DW_AT_type)? {
+        let type_offset = match attr.value() {
+            AttributeValue::UnitRef(offset) => offset,
+            _ => unreachable!(""),
+        };
+        if let Some((_, entry)) = unit.entries_at_offset(type_offset)?.next_dfs()? {
+            if entry.tag() != gimli::constants::DW_TAG_base_type {
+                bail!("Only primitive types are supported");
+            }
+            let base_type = match entry.attr(gimli::DW_AT_encoding)? {
+                Some(base_type) => match base_type.value() {
+                    AttributeValue::Encoding(value) => parse_base_type(value)?,
+                    _ => unreachable!("Unrecognized base type"),
+                },
+                _ => return Ok(None),
+            };
+            let byte_size = match entry.attr(gimli::DW_AT_byte_size)? {
+                Some(size) => match size.value() {
+                    AttributeValue::Udata(value) => Some(value),
+                    _ => unreachable!("Byte size stored in unexpected way"),
+                },
+                _ => None,
+            };
+            let bit_size = match entry.attr(gimli::DW_AT_bit_size)? {
+                Some(size) => match size.value() {
+                    AttributeValue::Udata(value) => Some(value),
+                    _ => unreachable!("Bit size stored in unexpected way"),
+                },
+                _ => None,
+            };
+            let size = bit_size.or(byte_size.map(|v| v * 8));
+            if let Some(size) = size {
+                return Ok(Some((base_type, size)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_base_type(value: DwAte) -> anyhow::Result<BaseType> {
+    match value {
+        gimli::DW_ATE_boolean => Ok(BaseType::Boolean),
+        gimli::DW_ATE_float => Ok(BaseType::Float),
+        gimli::DW_ATE_signed => Ok(BaseType::Signed),
+        gimli::DW_ATE_unsigned => Ok(BaseType::Unsigned),
+        _ => bail!("Unsupported base type"),
     }
 }
 
