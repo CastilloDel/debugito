@@ -168,6 +168,7 @@ impl DwarfInfo {
                 if entry.tag() != gimli::constants::DW_TAG_variable {
                     continue;
                 }
+                // TODO: Only relying on the variable name will lead to clashes
                 match self.get_variable_name_from_entry(entry) {
                     Some(current_name) if current_name == name => {}
                     _ => continue,
